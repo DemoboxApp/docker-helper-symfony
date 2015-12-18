@@ -1,0 +1,249 @@
+#!/bin/bash
+################################################################################
+# Demobox Symfony Toolbox for Dockerfiles
+#
+# Provides a set of commands to be used while building symfony images.
+# We do not provide a base image to allow maximum customization from the user.
+#
+# Copyright (c) 2015 Matthieu Bontemps <matthieu@demobox.io>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is furnished
+# to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# #################################################################################
+set -e
+PHP_CLI_INI=/usr/local/etc/php/php.ini
+PHP_FPM_INI=/usr/local/etc/php/fpm.ini
+MYSELF="$0"
+SRC_DIR=/src
+USER_HOME=/var/www
+
+# Create base app / composer cache dirs with the right perms
+# Also add the ssh keys of bitbucket/github so that they won't be asked later
+#
+# Usage:
+#   pre_build
+function pre_build {
+    mkdir -p ${SRC_DIR} ${USER_HOME}/.composer
+    chown www-data:www-data ${SRC_DIR} ${USER_HOME}/.composer
+
+    add_ssh_keys_for_typical_hosting_services
+}
+
+# Change ownership of the necessary dirs (because they were copied as root)
+#
+# Usage:
+#   fix_perms
+function fix_perms {
+    find . -user root -exec chown www-data:www-data {} \;
+}
+
+# Install Debian additional packages.
+#
+# Usage:
+#   install_packages [PACKAGE] [PACKAGE]
+function install_packages {
+    PACKAGES="$@"
+    apt-get update
+    apt-get install -y ${PACKAGES} --no-install-recommends
+    rm -r /var/lib/apt/lists/*
+}
+
+# Install Debian packages necessary to Symfony.
+#
+# Usage:
+#   install_symfony_packages [PACKAGE] [PACKAGE]
+function install_symfony_packages {
+    ADDITIONAL_PACKAGES="$@"
+    apt-get update
+    # openssh-client to be able to clone urls over the ssh protocol
+    PACKAGES="sudo netcat git g++ rsync openssh-client"
+    PACKAGES="${PACKAGES} zlib1g-dev libicu52 libssl-dev libicu-dev"
+    PACKAGES="${PACKAGES} libgd3 libpng12-dev"
+    PACKAGES="${PACKAGES} ${ADDITIONAL_PACKAGES}"
+
+    apt-get install -y ${PACKAGES} --no-install-recommends
+    rm -r /var/lib/apt/lists/*
+
+    # Install composer
+    curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+    # Allow the www-data user to run php-fpm with sudo and update the php-fpm config accordingly
+    if [ "${CONFIGURE_PHP_FPM}" = "1" ]; then
+        echo "www-data ALL=NOPASSWD: /usr/local/sbin/php-fpm" > /etc/sudoers.d/php-fpm
+        chmod 0440 /etc/sudoers.d/php-fpm
+        sed -i "s/^\(user\|group\) =.*//" /usr/local/etc/php-fpm.conf
+    fi
+}
+
+# Install PHP extensions.
+#
+# Usage:
+#   install_php_extensions [ADDITIONAL_EXT] [ADDITIONAL_PECL_EXTS]
+function install_php_extensions {
+    EXTS="$@"
+    docker-php-ext-install ${EXTS}
+}
+
+# Install PHP extensions required by Symfony.
+#
+# Usage:
+#   install_symfony_php_extensions
+function install_symfony_php_extensions {
+    EXTS="pdo_mysql mbstring intl pcntl zip bcmath"
+    docker-php-ext-configure intl
+
+    install_php_extensions ${EXTS}
+}
+
+# Install PECL extensions.
+#
+# Usage:
+#   install_pecl_extensions [ADDITIONAL_EXT] [ADDITIONAL_EXT] ...
+function install_pecl_extensions {
+    PECL_EXTS="$@"
+    if [ -n "${PECL_EXTS}" ]; then
+        pecl install ${PECL_EXTS}
+    fi
+}
+
+# Add configurations to your php.ini
+#
+# Usage:
+#   configure_php CLI_OR_FPM [ADDITIONAL_PHP_INI_LINE] [ADDITIONAL_PHP_INI_LINE] [ADDITIONAL_PHP_INI_LINE] ...
+#       CLI_OR_FPM: "cli" or "fpm" or "all"
+function configure_php {
+    CLI_OR_FPM=${1:-all}
+    shift
+    ARGS=$@
+
+    if [ "cli" == "${CLI_OR_FPM}" ]; then
+        PHP_INI=${PHP_CLI_INI}
+    elif [ "fpm" == "${CLI_OR_FPM}" ]; then
+        PHP_INI=${PHP_FPM_INI}
+    elif [ "all" == "${CLI_OR_FPM}" ]; then
+        configure_php cli ${ARGS}
+        configure_php fpm ${ARGS}
+
+        return
+    else
+        echo "> Wrong configure_php call in demobox-symfony!"
+        exit 1
+    fi
+
+    while [[ $# > 0 ]] ; do
+        echo "$1" >> ${PHP_INI}
+        shift
+    done
+}
+
+# Install and enable xdebug (only for PHP FPM).
+#
+# Usage:
+#   install_xdebug [ADDITIONAL_PHP_FPM_INI_LINE] [ADDITIONAL_PHP_FPM_INI_LINE] [ADDITIONAL_PHP_FPM_INI_LINE] ...
+function install_xdebug {
+    if [[ "${PHP_VERSION}" > '7.' ]]; then
+        pecl install xdebug-2.4.0RC3
+    else
+        pecl install xdebug
+    fi
+    find /usr/local/lib/php/extensions/ -name xdebug.so -exec echo zend_extension='"{}"' \; >> ${PHP_FPM_INI}
+
+    configure_php fpm "$@"
+}
+
+# Install and configure APCU with sensitive defaults.
+#
+# Usage:
+#   install_apcu [ADDITIONAL_PHP_FPM_INI_LINE] [ADDITIONAL_PHP_FPM_INI_LINE] [ADDITIONAL_PHP_FPM_INI_LINE] ...
+function install_apcu {
+    if [[ "${PHP_VERSION}" > '7.' ]]; then
+        install_pecl_extensions apcu
+    else
+        install_pecl_extensions apcu-4.0.10
+    fi
+
+    configure_php fpm \
+        "extension=apcu.so" \
+        "opcache.enable=1" \
+        "opcache.memory_consumption=128MB" \
+        "opcache.validate_timestamps=0" \
+        "opcache.max_accelerated_files=8000" \
+        "opcache.interned_strings_buffer=16MB" \
+        "opcache.fast_shutdown=1"
+
+    configure_php fpm "$@"
+}
+
+# Add the ssh keys of bitbucket/github so that they won't be asked later
+#
+# Usage:
+#   add_ssh_keys_for_typical_hosting_services
+function add_ssh_keys_for_typical_hosting_services {
+    mkdir -p ${USER_HOME}/.ssh
+    SSHKEY=$(ssh-keyscan -T 120 -t rsa bitbucket.org)
+    if [ -n "${SSHKEY}" ]; then
+        echo ${SSHKEY}|tee -a ${USER_HOME}/.ssh/known_hosts
+    else
+        echo "Unable to add bitbucket ssh key"
+        exit 1
+    fi
+
+    SSHKEY=$(ssh-keyscan -T 120 github.com)
+    if [ -n "${SSHKEY}" ]; then
+        echo ${SSHKEY}|tee -a ${USER_HOME}/.ssh/known_hosts
+    else
+        echo "Unable to add bitbucket ssh key"
+        exit 1
+    fi
+
+    chown -R www-data:www-data ${USER_HOME}/.ssh
+}
+
+# Install composer dependencies without running the post-install scripts.
+# This is because parameters.yml is not yet populated correctly: we wait for runtime.
+# We wait for all the source code to be copied to dump the autoload.
+#
+# Usage:
+#   composer_install_no_parameters [COMPOSER_PARAM]
+function composer_install_no_parameters {
+    PARAMS="$@"
+    composer config -g process-timeout 3000
+    # TODO --no-dev as option
+    composer install --no-ansi --no-progress --no-scripts --no-autoloader ${PARAMS}
+}
+
+# Dump composer autoload
+#
+# Usage:
+#   composer_dump_autoload [COMPOSER_PARAM]
+function composer_dump_autoload {
+    PARAMS="$@"
+    composer dump-autoload --no-ansi --optimize ${PARAMS}
+}
+
+if [ $# -gt 0 ]; then
+    CMD=$1
+    if [ "$(type -t ${CMD})" = 'function' ]; then
+        shift
+        ${CMD} $@
+    else
+        echo "$0: Command ${CMD} does not exist."
+        exit 1
+    fi
+fi
