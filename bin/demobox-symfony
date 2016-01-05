@@ -32,17 +32,53 @@ PHP_FPM_INI=/usr/local/etc/php/fpm.ini
 MYSELF="$0"
 SRC_DIR=/src
 USER_HOME=/var/www
+SUDOERS_PATH=/etc/sudoers.d/tmp-promote
 
-# Create base app / composer cache dirs with the right perms
-# Also add the ssh keys of bitbucket/github so that they won't be asked later
+# Invoke this method as root at the beginning of your script
 #
 # Usage:
 #   pre_build
 function pre_build {
+    # openssh-client to be able to clone urls over the ssh protocol
+    install_packages "sudo netcat git g++ rsync openssh-client"
+    add_sudo_rights
+    create_dirs
+    add_ssh_keys_for_typical_hosting_services
+}
+
+# Invoke this method at the end of the build
+#
+# Usage:
+#   post_build
+function post_build {
+    remove_sudo_rights
+}
+
+# Create the necessary source dirs with the right user
+#
+# Usage:
+#   create_dirs
+function create_dirs {
     mkdir -p ${SRC_DIR} ${USER_HOME}/.composer
     chown www-data:www-data ${SRC_DIR} ${USER_HOME}/.composer
+}
 
-    add_ssh_keys_for_typical_hosting_services
+# Add sudo rights to the www-data user - temporarily
+# MUST BE EXECUTED AS ROOT
+#
+# Usage:
+#   add_sudo_rights
+function add_sudo_rights {
+    echo "www-data ALL=(ALL) NOPASSWD:ALL" > ${SUDOERS_PATH}
+    chmod 0440 ${SUDOERS_PATH}
+}
+
+# Remove sudo rights from the www-data user
+#
+# Usage:
+#   remove_sudo_rights
+function remove_sudo_rights {
+    rm -f ${SUDOERS_PATH}
 }
 
 # Change ownership of the necessary dirs (because they were copied as root)
@@ -71,10 +107,7 @@ function install_packages {
 function install_symfony_packages {
     ADDITIONAL_PACKAGES="$@"
     apt-get update
-    # openssh-client to be able to clone urls over the ssh protocol
-    PACKAGES="sudo netcat git g++ rsync openssh-client"
-    PACKAGES="${PACKAGES} zlib1g-dev libicu52 libssl-dev libicu-dev"
-    PACKAGES="${PACKAGES} libgd3 libpng12-dev"
+    PACKAGES="zlib1g-dev libicu52 libssl-dev libicu-dev libgd3 libpng12-dev"
     PACKAGES="${PACKAGES} ${ADDITIONAL_PACKAGES}"
 
     apt-get install -y ${PACKAGES} --no-install-recommends
@@ -83,9 +116,9 @@ function install_symfony_packages {
     # Install composer
     curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
-    # Allow the www-data user to run php-fpm with sudo and update the php-fpm config accordingly
+    # Allow the www-data user to run php-fpm with and update the php-fpm config accordingly
     if [ "${CONFIGURE_PHP_FPM}" = "1" ]; then
-        echo "www-data ALL=NOPASSWD: /usr/local/sbin/php-fpm" > /etc/sudoers.d/php-fpm
+        echo "www-data ALL=NOPASSWD: /usr/local/sbin/php-fpm" | tee /etc/sudoers.d/php-fpm
         chmod 0440 /etc/sudoers.d/php-fpm
         sed -i "s/^\(user\|group\) =.*//" /usr/local/etc/php-fpm.conf
     fi
@@ -162,7 +195,7 @@ function install_xdebug {
     else
         pecl install xdebug
     fi
-    find /usr/local/lib/php/extensions/ -name xdebug.so -exec echo zend_extension='"{}"' \; >> ${PHP_FPM_INI}
+    find /usr/local/lib/php/extensions/ -name xdebug.so -exec echo zend_extension='"{}"' \; | tee -a ${PHP_FPM_INI}
 
     configure_php fpm "$@"
 }
